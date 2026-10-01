@@ -2,35 +2,31 @@ name: probe homebrew llvm
 
 # Temporary probe for lfortran/lfortran#13888.
 #
-# The tap's CI builds lfortran v0.66.0 against Homebrew's LLVM 23.1.2 inside
-# ghcr.io/homebrew/brew:main on x86_64 and `lfortran -c hello.f90` dies with
-# SIGSEGV. The same source against conda-forge's llvmdev 23.1.2 on the same
-# runner, outside the container, is green -- so the LLVM patch version is not
-# the variable. This probe holds the container fixed and moves one thing at a
-# time, and asks for a backtrace instead of guessing at a mechanism.
+# Findings so far, all on x86_64 in ghcr.io/homebrew/brew:main:
+#   - lfortran v0.66.0 built in-tree against Homebrew's LLVM 23.1.2 segfaults on
+#     `-c hello.f90` (139). So the crash is the build, not the bottle/install path.
+#   - The same source against conda-forge llvmdev 23.1.2 on the same runner,
+#     outside the container, is green. So the LLVM patch version is not the variable.
+#   - Backtrace: SIGSEGV in the X86 backend reached from the legacy pass manager,
+#     via getTargetTransformInfo -> getSubtargetImpl -> X86Subtarget ->
+#     X86GenSubtargetInfo -> X86ReadAdvanceTable, inside LLVMValuator::save_object_file.
+#   - `info sharedlibrary` shows no libLLVM.so: LLVM is linked statically into
+#     the lfortran binary.
 #
-#   homebrew-llvm + formula flags   expect 139; gives the crash site
-#   conda-llvm    + upstream flags  isolates the container toolchain from LLVM
+# This run pins down which of those two facts matters: the link line and the
+# faulting instruction, plus whether Homebrew's own tools (which link the dylib)
+# are fine on the same backend. A working `llc` against a crashing lfortran would
+# point at Homebrew's static archives rather than at LLVM or at lfortran.
 #
-# Both cells build in-tree (not through `brew bottle`), so a green homebrew
-# cell would also tell us the crash is introduced by the bottle/install path
-# rather than by the build.
-#
-# Container gotchas, all of which cost a run to find. The job runs as
-# uid=1000(linuxbrew) and:
+# Container gotchas, each of which cost a run. The job runs as uid=1000(linuxbrew):
 #   - `/__w/_temp/_runner_file_commands/` is root-owned, so any JS action
-#     (`actions/checkout`, `setup-micromamba`) dies with EACCES on
-#     `save_state_*` in its main *and* post step. Hence no `uses:` at all.
-#   - `$GITHUB_WORKSPACE` (`/__w/<repo>/<repo>`) is root-owned: `mkdir` fails.
-#   - `$HOME` is `/github/home`, not `/home/linuxbrew`, and is root-owned too:
-#     micromamba dies on `/github/home/.mamba/pkgs` and `.conda/environments.txt`.
+#     (`actions/checkout`, `setup-micromamba`) dies with EACCES on `save_state_*`.
+#   - `$GITHUB_WORKSPACE` and `$HOME` (= `/github/home`) are both root-owned.
 #   - writable: `/tmp` and `/home/linuxbrew`.
 # The tap's own CI never checks out and never writes those paths, which is why
 # none of this is visible from reading `tests.yml`.
 
 on:
-  # A push trigger, not workflow_dispatch: GitHub only dispatches a workflow
-  # that exists on the default branch, and this probe must not touch main.
   push:
     branches:
       - probe/homebrew-llvm
@@ -70,8 +66,8 @@ jobs:
           done
 
       # The release asset, not a git tag: this is exactly what the formula
-      # builds. Note it contains no build0.sh -- the generated sources are
-      # pre-baked -- which is why -DLFORTRAN_BUILD_ALL is a no-op here.
+      # builds. It contains no build0.sh -- the generated sources are pre-baked --
+      # which is why -DLFORTRAN_BUILD_ALL is a no-op here.
       - name: Fetch source
         shell: bash -e -l {0}
         run: |
@@ -82,8 +78,6 @@ jobs:
           mkdir -p /tmp/probe/src
           tar xzf /tmp/lfortran.tar.gz -C /tmp/probe/src --strip-components=1
 
-      # cmake and ninja are build deps of the formula; without them the build
-      # step dies with `cmake: command not found` (exit 127).
       - name: Install Homebrew LLVM, cmake, ninja, gdb
         if: matrix.llvm == 'homebrew'
         shell: bash -e -l {0}
@@ -104,10 +98,9 @@ jobs:
             https://github.com/mamba-org/micromamba-releases/releases/latest/download/micromamba-linux-64
           chmod +x /tmp/micromamba
           /tmp/micromamba create -y -p /tmp/lf -c conda-forge \
-            llvmdev=23.1.2 libunwind=1.7.2 bison=3.4 re2c=3.1 \
+            llvmdev=23.1.2 libunwind=1.7.2 zlib bison=3.4 re2c=3.1 \
             cmake=3.29.1 ninja=1.11.1 make=4.3 binutils=2.45.1 zstd-static=1.5.7
 
-      # If the two cells disagree, this is where the disagreement will show.
       - name: LLVM facts
         shell: bash -e -l {0}
         run: |
@@ -119,12 +112,11 @@ jobs:
           fi
           echo "prefix: ${PREFIX}"
           "${PREFIX}/bin/llvm-config" --version --assertion-mode --has-rtti --targets-built
-          echo "--- LLVM_NATIVE_ARCH ---"
-          grep -rh "LLVM_NATIVE_ARCH" "${PREFIX}"/lib/cmake/llvm/LLVMConfig.cmake
-          echo "--- abi-breaking.h ---"
+          grep -rh "LLVM_NATIVE_ARCH\|LLVM_LINK_LLVM_DYLIB" "${PREFIX}"/lib/cmake/llvm/LLVMConfig.cmake
           grep -E "^#define LLVM_ENABLE" "${PREFIX}"/include/llvm/Config/abi-breaking.h
-          echo "--- libLLVM ---"
-          ls -l "${PREFIX}"/lib/libLLVM.so* 2>/dev/null | head
+          echo "--- libLLVM.so ---"
+          ls -l "${PREFIX}"/lib/libLLVM.so* 2>/dev/null | head -3
+          echo "--- component archives present: $(ls "${PREFIX}"/lib/libLLVM*.a 2>/dev/null | wc -l) ---"
 
       - name: Build
         shell: bash -e -l {0}
@@ -133,13 +125,8 @@ jobs:
           if [[ "${{ matrix.llvm }}" == homebrew ]]; then
             PREFIX_ARGS="-DCMAKE_PREFIX_PATH=$(brew --prefix llvm);$(brew --prefix z3);$(brew --prefix zlib)"
             TRAP="$(brew --repo)/Library/Homebrew/cmake/trap_fetchcontent_provider.cmake"
-            if [[ -f "${TRAP}" ]]; then
-              TRAP_ARG="-DCMAKE_PROJECT_TOP_LEVEL_INCLUDES=${TRAP}"
-              echo "using Homebrew's FetchContent trap: ${TRAP}"
-            else
-              TRAP_ARG=""
-              echo "no FetchContent trap at ${TRAP}"
-            fi
+            TRAP_ARG=""
+            [[ -f "${TRAP}" ]] && TRAP_ARG="-DCMAKE_PROJECT_TOP_LEVEL_INCLUDES=${TRAP}"
           else
             export PATH="/tmp/lf/bin:${PATH}"
             PREFIX_ARGS="-DCMAKE_PREFIX_PATH=/tmp/lf"
@@ -165,8 +152,7 @@ jobs:
               "${PREFIX_ARGS}"
           else
             # Upstream's own recipe (Exhaustive-Checks-CI.yml at v0.66.0), minus
-            # the sccache launchers, with -g. LFORTRAN_BUILD_ALL is off because
-            # the release asset has no build0.sh to run.
+            # the sccache launchers, with -g.
             cmake . -GNinja \
               -DCMAKE_BUILD_TYPE=Release \
               -DCMAKE_CXX_FLAGS_RELEASE="-O3 -funroll-loops -DNDEBUG -g" \
@@ -179,6 +165,54 @@ jobs:
           fi
 
           cmake --build . -j"$(nproc)" --target install
+
+      # How LLVM actually got linked decides how to read the crash. lfortran's
+      # CMake takes the `llvm_map_components_to_libnames` branch when `LLVMCore`
+      # exists, and the bare `LLVM` branch otherwise; Homebrew ships both the
+      # dylib and every component archive.
+      - name: Link topology
+        if: always()
+        shell: bash -e -l {0}
+        run: |
+          set +e
+          cd /tmp/probe/src
+          echo "--- lfortran link line: LLVM references ---"
+          find . -name link.txt | while read -r f; do
+            echo "## ${f}"
+            tr ' ' '\n' < "${f}" | grep -iE "llvm" | sed 's#.*/##' | sort | uniq -c | sort -rn | head -25
+          done
+          echo "--- ldd ---"
+          ldd inst/bin/lfortran
+          echo "--- X86ReadAdvanceTable definitions ---"
+          PREFIX="$(brew --prefix llvm)"
+          for f in "${PREFIX}"/lib/libLLVM.so.23.1 "${PREFIX}"/lib/libLLVMX86*.a; do
+            printf '%s: %s\n' "$(basename "$f")" \
+              "$(nm -A --defined-only "$f" 2>/dev/null | grep -c 'X86ReadAdvanceTable')"
+          done
+          printf 'lfortran binary: %s\n' \
+            "$(nm --defined-only inst/bin/lfortran 2>/dev/null | grep -c 'X86ReadAdvanceTable')"
+
+      # Homebrew's own tools link the dylib, lfortran links the archives. If llc
+      # is fine on the same backend, the archives are the suspect, not LLVM.
+      - name: Homebrew's own LLVM tools on the same backend
+        if: always() && matrix.llvm == 'homebrew'
+        shell: bash -e -l {0}
+        run: |
+          set +e
+          PREFIX="$(brew --prefix llvm)"
+          echo "--- does llc link the dylib? ---"
+          ldd "${PREFIX}/bin/llc" | grep -i llvm
+          cat > /tmp/hello.ll <<'EOF'
+          define i32 @main() {
+            %1 = add i32 1, 2
+            ret i32 %1
+          }
+          EOF
+          "${PREFIX}/bin/llc" -O2 -filetype=obj /tmp/hello.ll -o /tmp/llc-hello.o
+          echo "!! llc exit: $?  obj: $(ls -l /tmp/llc-hello.o 2>/dev/null | awk '{print $5}')"
+          printf 'int f(int x) { return x + 1; }\n' > /tmp/hello.c
+          "${PREFIX}/bin/clang" -O2 -c /tmp/hello.c -o /tmp/clang-hello.o
+          echo "!! clang exit: $?  obj: $(ls -l /tmp/clang-hello.o 2>/dev/null | awk '{print $5}')"
 
       - name: Probe hello world
         if: always()
@@ -202,7 +236,7 @@ jobs:
           /tmp/hello
           echo "!! run exit: $?"
 
-      # The whole point: name the function instead of arguing about mechanisms.
+      # The whole point: name the instruction, not just the function.
       - name: Backtrace
         if: always()
         shell: bash -e -l {0}
@@ -217,6 +251,12 @@ jobs:
           gdb -batch -nx \
             -ex "set pagination off" \
             -ex "run -c /tmp/hello.f90 -o /tmp/hello.o" \
+            -ex "printf \"\\n=== fault ===\\n\"" \
+            -ex "p/x \$pc" \
+            -ex "info symbol \$pc" \
+            -ex "x/6i \$pc" \
+            -ex "p \$_siginfo._sifields._sigfault.si_addr" \
+            -ex "info registers" \
+            -ex "printf \"\\n=== bt ===\\n\"" \
             -ex "bt" \
-            -ex "info sharedlibrary" \
             --args "$(pwd)/inst/bin/lfortran"
