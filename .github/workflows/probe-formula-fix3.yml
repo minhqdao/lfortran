@@ -1,0 +1,104 @@
+name: formula end to end (v3)
+
+on:
+  push:
+    branches: [probe/formula-fix3]
+  workflow_dispatch:
+
+jobs:
+  arm:
+    name: ${{ matrix.arm }}
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/homebrew/brew:main
+      options: --privileged
+    env:
+      HOMEBREW_NO_INSTALL_FROM_API: "1"
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+      HOMEBREW_NO_ENV_HINTS: "1"
+    strategy:
+      fail-fast: false
+      matrix:
+        arm: [unpatched, lld, omit]
+    defaults:
+      run:
+        shell: bash -e -l {0}
+    steps:
+      - name: A writable HOME
+        run: |
+          mkdir -p /tmp/home
+          echo "HOME=$HOME  writable=$([[ -w $HOME ]] && echo yes || echo no)"
+          echo "HOME=/tmp/home" >> "$GITHUB_ENV"
+
+      - name: Install build deps
+        run: |
+          brew install cmake ninja llvm z3 zlib lld
+          echo "ld.lld: $(command -v ld.lld || echo MISSING)"
+
+      - name: Tap and patch the formula
+        run: |
+          set +e
+          brew tap fortran-lang/fortran
+          echo "!! tap exit: $?"
+          F="$(brew --repository fortran-lang/fortran)/Formula/lfortran.rb"
+          echo "formula: $F"
+          [[ -f $F ]] || { echo "no formula file"; exit 0; }
+
+          cat > /tmp/patch.rb <<'RBEOF'
+          p = ARGV[0]
+          s = File.read(p)
+          anchor = %q{cmake_args << "-DWITH_LSP=yes"}
+          abort("anchor not found") unless s.include?(anchor)
+          extra = case ENV["ARM"]
+                  when "lld"  then [%q{cmake_args << "-DCMAKE_C_FLAGS=-fuse-ld=lld"},
+                                    %q{cmake_args << "-DCMAKE_CXX_FLAGS=-fuse-ld=lld"}]
+                  when "omit" then [%q{cmake_args << "-DLLVM_OMIT_EXPORTS_FROM_CONFIG=ON"}]
+                  else []
+                  end
+          if extra.empty?
+            puts "unpatched"
+          else
+            s = s.sub(anchor, ([anchor] + extra).join("\n    "))
+            File.write(p, s)
+            puts "patched for #{ENV["ARM"]}"
+          end
+          RBEOF
+          ARM="${{ matrix.arm }}" ruby /tmp/patch.rb "$F"
+          echo "--- install method ---"
+          sed -n '/def install/,/^  end/p' "$F"
+
+      - name: brew install --build-from-source
+        run: |
+          set +e
+          brew install --build-from-source fortran-lang/fortran/lfortran > /tmp/install.log 2>&1
+          echo "!! brew install exit: $?"
+          echo "--- error lines ---"
+          grep -n -iE 'error|FAILED|Segmentation|cannot open shared' /tmp/install.log | head -20
+          echo "--- tail ---"
+          tail -20 /tmp/install.log
+
+      - name: brew test
+        run: |
+          set +e
+          brew test fortran-lang/fortran/lfortran > /tmp/test.log 2>&1
+          echo "!! brew test exit: $?"
+          echo "--- tail ---"
+          tail -25 /tmp/test.log
+
+      - name: Run hello world by hand
+        run: |
+          set +e
+          B="/home/linuxbrew/.linuxbrew/opt/lfortran/bin/lfortran"
+          [[ -x $B ]] || B="$(command -v lfortran)"
+          [[ -n $B && -x $B ]] || { echo "lfortran not found"; exit 0; }
+          echo "binary: $B"
+          printf 'program hello\n  print *, "Hello, World!"\nend program hello\n' > /tmp/hello.f90
+          echo "--- linkage ---"
+          ldd "$B" | grep -iE 'libLLVM|libunwind' || echo "  (neither)"
+          echo "--- --version ---"
+          "$B" --version 2>&1 | head -4; echo "!! --version exit: ${PIPESTATUS[0]}"
+          echo "--- -c ---"
+          "$B" -c /tmp/hello.f90 -o /tmp/hello.o; echo "!! -c exit: $?"
+          echo "--- full compile ---"
+          "$B" /tmp/hello.f90 -o /tmp/hello; echo "!! full exit: $?"
+          if [[ -x /tmp/hello ]]; then /tmp/hello; echo "!! run exit: $?"; else echo "  no executable"; fi
