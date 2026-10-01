@@ -16,10 +16,13 @@ name: probe homebrew llvm
 # cell would also tell us the crash is introduced by the bottle/install path
 # rather than by the build.
 #
-# No `uses:` steps anywhere: the brew container's default user cannot write the
-# runner's file-command directory, so `actions/checkout` and friends die with
-# EACCES on `/__w/_temp/_runner_file_commands/save_state_*`. The tap's own CI
-# never checks out, which is why that trap is not already documented.
+# No `uses:` steps anywhere, and nothing written under $GITHUB_WORKSPACE: the brew
+# container's default user (linuxbrew) can write neither the runner's file-command
+# directory (`/__w/_temp/_runner_file_commands/save_state_*`) nor the workspace
+# itself (`/__w/<repo>/<repo>`, root-owned). `actions/checkout` dies with EACCES on
+# the first, and `mkdir` on the second. So the source is curled into $HOME/probe.
+# The tap's own CI never checks out and never writes the workspace, which is why
+# neither trap is visible from reading `tests.yml`.
 
 on:
   # A push trigger, not workflow_dispatch: GitHub only dispatches a workflow
@@ -59,8 +62,8 @@ jobs:
             https://github.com/lfortran/lfortran/releases/download/v0.66.0/lfortran-0.66.0.tar.gz
           echo "961d84f49d07951a279b7835e0f9864489a167a80a8c3c502a797fb6c61669c7  /tmp/lfortran.tar.gz" \
             | sha256sum -c -
-          mkdir -p "$GITHUB_WORKSPACE/src"
-          tar xzf /tmp/lfortran.tar.gz -C "$GITHUB_WORKSPACE/src" --strip-components=1
+          mkdir -p "$HOME/probe/src"
+          tar xzf /tmp/lfortran.tar.gz -C "$HOME/probe/src" --strip-components=1
 
       - name: Install Homebrew LLVM and gdb
         if: matrix.llvm == 'homebrew'
@@ -78,6 +81,7 @@ jobs:
           curl -sSL -o /tmp/micromamba \
             https://github.com/mamba-org/micromamba-releases/releases/latest/download/micromamba-linux-64
           chmod +x /tmp/micromamba
+          export MAMBA_ROOT_PREFIX=/tmp/mmroot
           /tmp/micromamba create -y -p /tmp/lf -c conda-forge \
             llvmdev=23.1.2 libunwind=1.7.2 bison=3.4 re2c=3.1 \
             cmake=3.29.1 ninja=1.11.1 make=4.3 binutils=2.45.1 zstd-static=1.5.7
@@ -104,7 +108,7 @@ jobs:
       - name: Build
         shell: bash -e -l {0}
         run: |
-          cd "$GITHUB_WORKSPACE/src"
+          cd "$HOME/probe/src"
           if [[ "${{ matrix.llvm }}" == homebrew ]]; then
             LLVM_PREFIX="$(brew --prefix llvm)"
             PREFIX_ARGS="-DCMAKE_PREFIX_PATH=${LLVM_PREFIX};$(brew --prefix z3);$(brew --prefix zlib)"
@@ -151,7 +155,7 @@ jobs:
         shell: bash -e -l {0}
         run: |
           set +e
-          cd "$GITHUB_WORKSPACE/src"
+          cd "$HOME/probe/src"
           LF="$(pwd)/inst/bin/lfortran"
           echo "=== ${{ matrix.name }} ==="
           if [[ ! -x "${LF}" ]]; then
@@ -174,7 +178,7 @@ jobs:
         shell: bash -e -l {0}
         run: |
           set +e
-          cd "$GITHUB_WORKSPACE/src"
+          cd "$HOME/probe/src"
           if ! command -v gdb >/dev/null; then
             echo "!! no gdb available, skipping backtrace"
             exit 0
