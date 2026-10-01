@@ -1,0 +1,91 @@
+name: omit-exports full build
+
+on:
+  push:
+    branches: [probe/omit-full]
+  workflow_dispatch:
+
+jobs:
+  full:
+    name: omit-exports, full build + hello world
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/homebrew/brew:main
+      options: --privileged
+    defaults:
+      run:
+        shell: bash -e -l {0}
+    steps:
+      - name: Install Homebrew LLVM, cmake, ninja, gdb
+        run: brew install llvm z3 zlib cmake ninja gdb
+
+      - name: Fetch source
+        run: |
+          curl -sSL -o /tmp/lfortran.tar.gz \
+            https://github.com/lfortran/lfortran/releases/download/v0.66.0/lfortran-0.66.0.tar.gz
+          echo "961d84f49d07951a279b7835e0f9864489a167a80a8c3c502a797fb6c61669c7  /tmp/lfortran.tar.gz" \
+            | sha256sum -c -
+          mkdir -p /tmp/src
+          tar xzf /tmp/lfortran.tar.gz -C /tmp/src --strip-components=1
+
+      - name: Configure
+        run: |
+          set +e
+          PREFIX="$(brew --prefix llvm)"
+          cd /tmp/src
+          cmake . -GNinja -B build \
+            -DCMAKE_INSTALL_PREFIX=/tmp/inst \
+            -DCMAKE_INSTALL_LIBDIR=lib \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_FLAGS_RELEASE="-O3 -funroll-loops -DNDEBUG -g" \
+            -DWITH_LLVM=ON \
+            -DWITH_LSP=yes \
+            -DLLVM_OMIT_EXPORTS_FROM_CONFIG=ON \
+            -DCMAKE_EXE_LINKER_FLAGS="-L${PREFIX}/lib" \
+            -DCMAKE_PREFIX_PATH="${PREFIX};$(brew --prefix z3);$(brew --prefix zlib)" \
+            > /tmp/configure.log 2>&1
+          echo "!! configure exit: $?"
+          echo "  link tokens: $(grep -oE '(-lLLVM[A-Za-z0-9_.-]*|libLLVM[A-Za-z0-9_.-]*\.(a|so[0-9.]*))' build/build.ninja | sed 's#.*/##' | sort -u | tr '\n' ' ')"
+          echo "  archives: $(grep -oE 'libLLVM[A-Za-z0-9_.-]*\.a' build/build.ninja | sort -u | wc -l)"
+
+      - name: Full build
+        run: |
+          set +e
+          cd /tmp/src
+          cmake --build build -j"$(nproc)" > /tmp/build.log 2>&1
+          echo "!! full build exit: $?"
+          echo "--- FAILED / ninja error lines ---"
+          grep -n -B3 -A25 -E 'FAILED|ninja: error|error while loading' /tmp/build.log | head -80
+          echo "--- tail ---"
+          tail -25 /tmp/build.log
+
+      - name: Install and run hello world
+        run: |
+          set +e
+          cd /tmp/src
+          cmake --install build > /tmp/install.log 2>&1
+          echo "!! install exit: $?"
+          export LD_LIBRARY_PATH="/home/linuxbrew/.linuxbrew/lib:$(brew --prefix llvm)/lib:$(brew --prefix z3)/lib:$(brew --prefix zlib)/lib"
+          printf 'program hello\n  print *, "Hello, World!"\nend program hello\n' > /tmp/hello.f90
+          B=/tmp/inst/bin/lfortran
+          [[ -x $B ]] || { echo "no lfortran binary"; exit 0; }
+          echo "--- linkage ---"
+          ldd "$B" | grep -iE 'libLLVM|libunwind'
+          echo "--- installed lib dir ---"
+          ls /tmp/inst/lib | head
+          echo "--- --version ---"
+          "$B" --version; echo "!! --version exit: $?"
+          echo "--- -c ---"
+          "$B" -c /tmp/hello.f90 -o /tmp/hello.o; echo "!! -c exit: $?"
+          echo "--- full compile ---"
+          "$B" /tmp/hello.f90 -o /tmp/hello; echo "!! full exit: $?"
+          if [[ -x /tmp/hello ]]; then /tmp/hello; echo "!! run exit: $?"; else echo "  no executable produced"; fi
+
+      - name: Does the upstream test suite still pass
+        run: |
+          set +e
+          export LD_LIBRARY_PATH="/home/linuxbrew/.linuxbrew/lib:$(brew --prefix llvm)/lib:$(brew --prefix z3)/lib:$(brew --prefix zlib)/lib"
+          cd /tmp/src/build
+          ctest --output-on-failure -j"$(nproc)" > /tmp/ctest.log 2>&1
+          echo "!! ctest exit: $?"
+          tail -25 /tmp/ctest.log
