@@ -1,0 +1,191 @@
+name: probe homebrew llvm
+
+# Temporary probe for lfortran/lfortran#13888.
+#
+# The tap's CI builds lfortran v0.66.0 against Homebrew's LLVM 23.1.2 inside
+# ghcr.io/homebrew/brew:main on x86_64 and `lfortran -c hello.f90` dies with
+# SIGSEGV. The same source against conda-forge's llvmdev 23.1.2 on the same
+# runner, outside the container, is green -- so the LLVM patch version is not
+# the variable. This probe holds the container fixed and moves one thing at a
+# time, and asks for a backtrace instead of guessing at a mechanism.
+#
+#   homebrew-llvm + formula flags   expect 139; gives the crash site
+#   conda-llvm    + upstream flags  isolates the container toolchain from LLVM
+#
+# Both cells build in-tree (not through `brew bottle`), so a green homebrew
+# cell would also tell us the crash is introduced by the bottle/install path
+# rather than by the build.
+
+on:
+  # A push trigger, not workflow_dispatch: GitHub only dispatches a workflow
+  # that exists on the default branch, and this probe must not touch main.
+  push:
+    branches:
+      - probe/homebrew-llvm
+  workflow_dispatch:
+
+jobs:
+  probe:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    container:
+      image: ghcr.io/homebrew/brew:main
+      options: --privileged
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: homebrew-llvm + formula flags
+            llvm: homebrew
+            flags: formula
+          - name: conda-llvm + upstream flags
+            llvm: conda
+            flags: upstream
+
+    steps:
+      # Always upstream's source, never the fork's, so provenance is unambiguous.
+      - uses: actions/checkout@v7
+        with:
+          repository: lfortran/lfortran
+          ref: v0.66.0
+          path: src
+
+      - name: Install Homebrew LLVM
+        if: matrix.llvm == 'homebrew'
+        run: |
+          brew install llvm z3 zlib
+          brew --prefix llvm
+
+      - uses: mamba-org/setup-micromamba@v2.0.2
+        if: matrix.llvm == 'conda'
+        with:
+          micromamba-version: "2.0.4-0"
+          environment-file: src/ci/environment_linux_llvm.yml
+          create-args: >-
+            python=3.10
+            llvmdev=23.1.2
+            bison=3.4
+            openblas=0.3.21
+            llvm-openmp=14.0.4
+            make=4.3
+            openmpi=5.0.10
+            binutils=2.45.1
+            zstd-static=1.5.7
+
+      # Upstream installs this separately for llvm-version > 11; without it cmake
+      # dies at "Could NOT find LIBUNWIND (missing: LIBUNWIND_INCLUDE_DIR ...)".
+      - name: Install libunwind (conda cell)
+        if: matrix.llvm == 'conda'
+        shell: bash -e -l {0}
+        run: micromamba install -y -n lf libunwind=1.7.2
+
+      # If the two cells disagree, this is where the disagreement will show.
+      - name: LLVM facts
+        shell: bash -e -l {0}
+        run: |
+          set +e
+          if [[ "${{ matrix.llvm }}" == homebrew ]]; then
+            PREFIX="$(brew --prefix llvm)"
+          else
+            PREFIX="${CONDA_PREFIX}"
+          fi
+          echo "prefix: ${PREFIX}"
+          "${PREFIX}/bin/llvm-config" --version --assertion-mode --has-rtti --targets-built
+          echo "--- LLVM_NATIVE_ARCH ---"
+          grep -rh "LLVM_NATIVE_ARCH" "${PREFIX}"/lib/cmake/llvm/LLVMConfig.cmake
+          echo "--- abi-breaking.h ---"
+          grep -E "^#define LLVM_ENABLE" "${PREFIX}"/include/llvm/Config/abi-breaking.h
+          echo "--- libLLVM ---"
+          ls -l "${PREFIX}"/lib/libLLVM* 2>/dev/null | head
+
+      # Both cells build the release tarball's own generated sources, so neither
+      # needs re2c/bison; `-DLFORTRAN_BUILD_ALL` is left at its default (off) for
+      # the formula cell and set for the upstream cell, matching each in reality.
+      - name: Build
+        shell: bash -e -l {0}
+        run: |
+          cd src
+          PREFIX_ARGS=()
+          if [[ "${{ matrix.llvm }}" == homebrew ]]; then
+            LLVM_PREFIX="$(brew --prefix llvm)"
+            PREFIX_ARGS+=("-DCMAKE_PREFIX_PATH=${LLVM_PREFIX};$(brew --prefix z3);$(brew --prefix zlib)")
+          fi
+
+          if [[ "${{ matrix.flags }}" == formula ]]; then
+            # Exactly what Formula/lfortran.rb passes on Linux (std_cmake_args
+            # plus three flags), with -g appended so the crash site is nameable.
+            cmake . -GNinja \
+              -DCMAKE_INSTALL_PREFIX="$(pwd)/inst" \
+              -DCMAKE_INSTALL_LIBDIR=lib \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DCMAKE_FIND_FRAMEWORK=LAST \
+              -DCMAKE_VERBOSE_MAKEFILE=ON \
+              -DCMAKE_PROJECT_TOP_LEVEL_INCLUDES="$(brew --repo)/Library/Homebrew/cmake/trap_fetchcontent_provider.cmake" \
+              -Wno-author \
+              -DBUILD_TESTING=OFF \
+              -DCCACHE_FOUND=OFF \
+              -DCMAKE_CXX_FLAGS_RELEASE="-O3 -funroll-loops -DNDEBUG -g" \
+              -DWITH_LLVM=ON \
+              -DWITH_LSP=yes \
+              "${PREFIX_ARGS[@]}"
+          else
+            # Upstream's own recipe (Exhaustive-Checks-CI.yml at v0.66.0), minus
+            # the sccache launchers, plus -g.
+            ./build0.sh
+            cmake . -GNinja \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DCMAKE_CXX_FLAGS_RELEASE="-O3 -funroll-loops -DNDEBUG -g" \
+              -DWITH_LLVM=yes \
+              -DWITH_LSP=yes \
+              -DLFORTRAN_BUILD_ALL=yes \
+              -DWITH_STACKTRACE=no \
+              -DCMAKE_PREFIX_PATH="${CONDA_PREFIX}" \
+              -DCMAKE_INSTALL_PREFIX="$(pwd)/inst"
+          fi
+
+          cmake --build . -j"$(nproc)" --target install
+
+      - name: Probe hello world
+        if: always()
+        shell: bash -e -l {0}
+        run: |
+          set +e
+          cd src
+          LF="$(pwd)/inst/bin/lfortran"
+          echo "=== ${{ matrix.name }} ==="
+          if [[ ! -x "${LF}" ]]; then
+            echo "!! build produced no lfortran binary"
+            exit 0
+          fi
+          "${LF}" --version
+          echo "!! --version exit: $?"
+          printf 'program hello\n  print *, "Hello, World!"\nend program hello\n' > /tmp/hello.f90
+          "${LF}" -c /tmp/hello.f90 -o /tmp/hello.o
+          echo "!! -c exit: $?"
+          "${LF}" /tmp/hello.f90 -o /tmp/hello
+          echo "!! full exit: $?"
+          /tmp/hello
+          echo "!! run exit: $?"
+
+      # The whole point: name the function instead of arguing about mechanisms.
+      - name: Backtrace
+        if: always()
+        shell: bash -e -l {0}
+        run: |
+          set +e
+          cd src
+          if ! command -v gdb >/dev/null; then
+            brew install gdb || { sudo apt-get update -qq && sudo apt-get install -y -qq gdb; }
+          fi
+          if ! command -v gdb >/dev/null; then
+            echo "!! no gdb available, skipping backtrace"
+            exit 0
+          fi
+          printf 'program hello\n  print *, "Hello, World!"\nend program hello\n' > /tmp/hello.f90
+          gdb -batch -nx \
+            -ex "set pagination off" \
+            -ex "run -c /tmp/hello.f90 -o /tmp/hello.o" \
+            -ex "bt" \
+            -ex "info sharedlibrary" \
+            --args "$(pwd)/inst/bin/lfortran"
