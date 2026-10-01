@@ -15,6 +15,11 @@ name: probe homebrew llvm
 # Both cells build in-tree (not through `brew bottle`), so a green homebrew
 # cell would also tell us the crash is introduced by the bottle/install path
 # rather than by the build.
+#
+# No `uses:` steps anywhere: the brew container's default user cannot write the
+# runner's file-command directory, so `actions/checkout` and friends die with
+# EACCES on `/__w/_temp/_runner_file_commands/save_state_*`. The tap's own CI
+# never checks out, which is why that trap is not already documented.
 
 on:
   # A push trigger, not workflow_dispatch: GitHub only dispatches a workflow
@@ -44,41 +49,38 @@ jobs:
             flags: upstream
 
     steps:
-      # Always upstream's source, never the fork's, so provenance is unambiguous.
-      - uses: actions/checkout@v7
-        with:
-          repository: lfortran/lfortran
-          ref: v0.66.0
-          path: src
-
-      - name: Install Homebrew LLVM
-        if: matrix.llvm == 'homebrew'
+      # The release asset, not a git tag: this is exactly what the formula
+      # builds. Note it contains no build0.sh -- the generated sources are
+      # pre-baked -- which is why -DLFORTRAN_BUILD_ALL is a no-op here.
+      - name: Fetch source
+        shell: bash -e -l {0}
         run: |
-          brew install llvm z3 zlib
+          curl -sSL -o /tmp/lfortran.tar.gz \
+            https://github.com/lfortran/lfortran/releases/download/v0.66.0/lfortran-0.66.0.tar.gz
+          echo "961d84f49d07951a279b7835e0f9864489a167a80a8c3c502a797fb6c61669c7  /tmp/lfortran.tar.gz" \
+            | sha256sum -c -
+          mkdir -p "$GITHUB_WORKSPACE/src"
+          tar xzf /tmp/lfortran.tar.gz -C "$GITHUB_WORKSPACE/src" --strip-components=1
+
+      - name: Install Homebrew LLVM and gdb
+        if: matrix.llvm == 'homebrew'
+        shell: bash -e -l {0}
+        run: |
+          brew install llvm z3 zlib gdb
           brew --prefix llvm
 
-      - uses: mamba-org/setup-micromamba@v2.0.2
-        if: matrix.llvm == 'conda'
-        with:
-          micromamba-version: "2.0.4-0"
-          environment-file: src/ci/environment_linux_llvm.yml
-          create-args: >-
-            python=3.10
-            llvmdev=23.1.2
-            bison=3.4
-            openblas=0.3.21
-            llvm-openmp=14.0.4
-            make=4.3
-            openmpi=5.0.10
-            binutils=2.45.1
-            zstd-static=1.5.7
-
-      # Upstream installs this separately for llvm-version > 11; without it cmake
-      # dies at "Could NOT find LIBUNWIND (missing: LIBUNWIND_INCLUDE_DIR ...)".
-      - name: Install libunwind (conda cell)
+      # Installed by hand rather than with setup-micromamba, for the same reason
+      # there is no checkout: it is a JS action.
+      - name: Install conda LLVM
         if: matrix.llvm == 'conda'
         shell: bash -e -l {0}
-        run: micromamba install -y -n lf libunwind=1.7.2
+        run: |
+          curl -sSL -o /tmp/micromamba \
+            https://github.com/mamba-org/micromamba-releases/releases/latest/download/micromamba-linux-64
+          chmod +x /tmp/micromamba
+          /tmp/micromamba create -y -p /tmp/lf -c conda-forge \
+            llvmdev=23.1.2 libunwind=1.7.2 bison=3.4 re2c=3.1 \
+            cmake=3.29.1 ninja=1.11.1 make=4.3 binutils=2.45.1 zstd-static=1.5.7
 
       # If the two cells disagree, this is where the disagreement will show.
       - name: LLVM facts
@@ -88,7 +90,7 @@ jobs:
           if [[ "${{ matrix.llvm }}" == homebrew ]]; then
             PREFIX="$(brew --prefix llvm)"
           else
-            PREFIX="${CONDA_PREFIX}"
+            PREFIX="/tmp/lf"
           fi
           echo "prefix: ${PREFIX}"
           "${PREFIX}/bin/llvm-config" --version --assertion-mode --has-rtti --targets-built
@@ -99,17 +101,15 @@ jobs:
           echo "--- libLLVM ---"
           ls -l "${PREFIX}"/lib/libLLVM* 2>/dev/null | head
 
-      # Both cells build the release tarball's own generated sources, so neither
-      # needs re2c/bison; `-DLFORTRAN_BUILD_ALL` is left at its default (off) for
-      # the formula cell and set for the upstream cell, matching each in reality.
       - name: Build
         shell: bash -e -l {0}
         run: |
-          cd src
-          PREFIX_ARGS=()
+          cd "$GITHUB_WORKSPACE/src"
           if [[ "${{ matrix.llvm }}" == homebrew ]]; then
             LLVM_PREFIX="$(brew --prefix llvm)"
-            PREFIX_ARGS+=("-DCMAKE_PREFIX_PATH=${LLVM_PREFIX};$(brew --prefix z3);$(brew --prefix zlib)")
+            PREFIX_ARGS="-DCMAKE_PREFIX_PATH=${LLVM_PREFIX};$(brew --prefix z3);$(brew --prefix zlib)"
+          else
+            PREFIX_ARGS="-DCMAKE_PREFIX_PATH=/tmp/lf"
           fi
 
           if [[ "${{ matrix.flags }}" == formula ]]; then
@@ -128,20 +128,20 @@ jobs:
               -DCMAKE_CXX_FLAGS_RELEASE="-O3 -funroll-loops -DNDEBUG -g" \
               -DWITH_LLVM=ON \
               -DWITH_LSP=yes \
-              "${PREFIX_ARGS[@]}"
+              "${PREFIX_ARGS}"
           else
             # Upstream's own recipe (Exhaustive-Checks-CI.yml at v0.66.0), minus
-            # the sccache launchers, plus -g.
-            ./build0.sh
+            # the sccache launchers, with -g. LFORTRAN_BUILD_ALL is off because
+            # the release asset has no build0.sh to run.
             cmake . -GNinja \
               -DCMAKE_BUILD_TYPE=Release \
               -DCMAKE_CXX_FLAGS_RELEASE="-O3 -funroll-loops -DNDEBUG -g" \
               -DWITH_LLVM=yes \
               -DWITH_LSP=yes \
-              -DLFORTRAN_BUILD_ALL=yes \
+              -DLFORTRAN_BUILD_ALL=no \
               -DWITH_STACKTRACE=no \
-              -DCMAKE_PREFIX_PATH="${CONDA_PREFIX}" \
-              -DCMAKE_INSTALL_PREFIX="$(pwd)/inst"
+              -DCMAKE_INSTALL_PREFIX="$(pwd)/inst" \
+              "${PREFIX_ARGS}"
           fi
 
           cmake --build . -j"$(nproc)" --target install
@@ -151,7 +151,7 @@ jobs:
         shell: bash -e -l {0}
         run: |
           set +e
-          cd src
+          cd "$GITHUB_WORKSPACE/src"
           LF="$(pwd)/inst/bin/lfortran"
           echo "=== ${{ matrix.name }} ==="
           if [[ ! -x "${LF}" ]]; then
@@ -174,10 +174,7 @@ jobs:
         shell: bash -e -l {0}
         run: |
           set +e
-          cd src
-          if ! command -v gdb >/dev/null; then
-            brew install gdb || { sudo apt-get update -qq && sudo apt-get install -y -qq gdb; }
-          fi
+          cd "$GITHUB_WORKSPACE/src"
           if ! command -v gdb >/dev/null; then
             echo "!! no gdb available, skipping backtrace"
             exit 0
