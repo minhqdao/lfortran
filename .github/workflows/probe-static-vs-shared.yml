@@ -1,0 +1,185 @@
+name: static archives vs dylib (v2)
+
+on:
+  push:
+    branches: [probe/static-vs-shared]
+  workflow_dispatch:
+
+jobs:
+  repro:
+    name: archives vs dylib
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/homebrew/brew:main
+      options: --privileged
+    defaults:
+      run:
+        shell: bash -e -l {0}
+    steps:
+      - name: Install Homebrew LLVM, cmake, ninja, gdb
+        run: |
+          brew install llvm z3 zlib cmake ninja gdb
+          brew --prefix llvm
+
+      - name: llvm-config link modes
+        run: |
+          set +e
+          PREFIX="$(brew --prefix llvm)"
+          C="x86codegen x86desc x86info x86asmparser x86disassembler mc support targetparser"
+          echo "--- --libs ---";               "${PREFIX}/bin/llvm-config" --libs $C
+          echo "--- --link-static --libs ---"; "${PREFIX}/bin/llvm-config" --link-static --libs $C
+          echo "--- --link-shared --libs ---"; "${PREFIX}/bin/llvm-config" --link-shared --libs $C
+          echo "--- --link-static --libnames ---"; "${PREFIX}/bin/llvm-config" --link-static --libnames $C
+          echo "--- do the archives exist? ---"
+          for a in LLVMX86CodeGen LLVMX86Desc LLVMX86Info LLVMCore LLVMSupport LLVMMC; do
+            ls -l "${PREFIX}/lib/lib${a}.a" 2>&1 | sed 's/^/  /'
+          done
+          echo "--- is X86ReadAdvanceTable global in the archive, local in the dylib? ---"
+          nm -C --defined-only "${PREFIX}/lib/libLLVMX86Desc.a" 2>/dev/null | grep X86ReadAdvanceTable
+          nm -C --defined-only "${PREFIX}/lib/libLLVM.so.23.1" 2>/dev/null | grep X86ReadAdvanceTable
+
+      - name: Fetch source
+        run: |
+          curl -sSL -o /tmp/lfortran.tar.gz \
+            https://github.com/lfortran/lfortran/releases/download/v0.66.0/lfortran-0.66.0.tar.gz
+          echo "961d84f49d07951a279b7835e0f9864489a167a80a8c3c502a797fb6c61669c7  /tmp/lfortran.tar.gz" \
+            | sha256sum -c -
+          mkdir -p /tmp/probe/src
+          tar xzf /tmp/lfortran.tar.gz -C /tmp/probe/src --strip-components=1
+
+      - name: Does LLVM_OMIT_EXPORTS_FROM_CONFIG flip lfortran to the dylib?
+        run: |
+          set +e
+          PREFIX_PATH="$(brew --prefix llvm);$(brew --prefix z3);$(brew --prefix zlib)"
+          COMMON=(
+            -GNinja
+            -DCMAKE_INSTALL_LIBDIR=lib
+            -DCMAKE_BUILD_TYPE=Release
+            -DCMAKE_CXX_FLAGS_RELEASE="-O3 -funroll-loops -DNDEBUG -g"
+            -DWITH_LLVM=ON
+            -DWITH_LSP=yes
+            -DCMAKE_PREFIX_PATH="$PREFIX_PATH"
+          )
+          for variant in default omit; do
+            rm -rf /tmp/probe/$variant
+            cp -a /tmp/probe/src /tmp/probe/$variant
+            cd /tmp/probe/$variant
+            extra=()
+            [[ "$variant" == omit ]] && extra=(-DLLVM_OMIT_EXPORTS_FROM_CONFIG=ON)
+            cmake . "${COMMON[@]}" "${extra[@]}" -DCMAKE_INSTALL_PREFIX="$(pwd)/inst" \
+              > /tmp/configure-$variant.log 2>&1
+            echo "=== $variant: configure exit $? ==="
+            echo "--- LLVM dylib vs archives in build.ninja ---"
+            printf '  %-28s %s\n' "libLLVM.so"  "$(grep -c 'libLLVM\.so' build.ninja)"
+            printf '  %-28s %s\n' "libLLVM*.a"  "$(grep -o 'libLLVM[A-Za-z0-9_.-]*\.a' build.ninja | sort -u | wc -l)"
+            echo "--- what the lfortran link line uses ---"
+            ninja -t commands lfortran 2>/dev/null | tail -1 \
+              | tr ' ' '\n' | grep -oE 'libLLVM[A-Za-z0-9_.-]*(\.a|\.so[0-9.]*)?' | sort -u | head -20
+          done
+
+      - name: Minimal reproducer via CMake, archives vs dylib
+        run: |
+          set +e
+          mkdir -p /tmp/repro
+          cat > /tmp/repro/repro.cpp <<'EOF'
+          #include "llvm/Analysis/TargetTransformInfo.h"
+          #include "llvm/IR/Function.h"
+          #include "llvm/IR/IRBuilder.h"
+          #include "llvm/IR/LLVMContext.h"
+          #include "llvm/IR/Module.h"
+          #include "llvm/MC/TargetRegistry.h"
+          #include "llvm/Support/TargetSelect.h"
+          #include "llvm/Target/TargetMachine.h"
+          #include "llvm/Target/TargetOptions.h"
+          #include "llvm/TargetParser/Host.h"
+          #include <cstdio>
+          #include <memory>
+
+          int main() {
+            llvm::InitializeNativeTarget();
+            llvm::InitializeNativeTargetAsmPrinter();
+            llvm::Triple TT(llvm::sys::getDefaultTargetTriple());
+            std::string Err;
+            const llvm::Target *T = llvm::TargetRegistry::lookupTarget(TT, Err);
+            if (!T) { std::fprintf(stderr, "no target: %s\n", Err.c_str()); return 2; }
+            std::unique_ptr<llvm::TargetMachine> TM(
+                T->createTargetMachine(TT, "generic", "", llvm::TargetOptions()));
+            if (!TM) { std::fprintf(stderr, "no target machine\n"); return 2; }
+
+            llvm::LLVMContext Ctx;
+            auto M = std::make_unique<llvm::Module>("m", Ctx);
+            llvm::IRBuilder<> B(Ctx);
+            auto *FT = llvm::FunctionType::get(B.getInt32Ty(), false);
+            auto *F = llvm::Function::Create(FT, llvm::GlobalValue::ExternalLinkage, "f", M.get());
+
+            std::printf("calling getTargetIRAnalysis...\n");
+            std::fflush(stdout);
+            auto TIRA = TM->getTargetIRAnalysis();
+            TIRA(*F);
+            std::printf("ok\n");
+            return 0;
+          }
+          EOF
+
+          cat > /tmp/repro/CMakeLists.txt <<'EOF'
+          cmake_minimum_required(VERSION 3.20)
+          project(repro CXX)
+          find_package(LLVM REQUIRED CONFIG)
+          message(STATUS "LLVM_PACKAGE_VERSION=${LLVM_PACKAGE_VERSION}")
+          message(STATUS "LLVM_LINK_LLVM_DYLIB=${LLVM_LINK_LLVM_DYLIB}")
+          if (TARGET LLVMCore)
+            get_target_property(t LLVMCore TYPE)
+            message(STATUS "TARGET LLVMCore TYPE=${t}")
+          endif()
+          if (TARGET LLVM)
+            get_target_property(t LLVM TYPE)
+            get_target_property(l LLVM IMPORTED_LOCATION)
+            message(STATUS "TARGET LLVM TYPE=${t} LOCATION=${l}")
+          else()
+            message(STATUS "TARGET LLVM = FALSE")
+          endif()
+          include_directories(${LLVM_INCLUDE_DIRS})
+          add_definitions(${LLVM_DEFINITIONS})
+          set(CMAKE_CXX_STANDARD 17)
+
+          llvm_map_components_to_libnames(libs
+            core support mcjit orcjit native asmparser asmprinter targetparser
+            x86info x86desc x86codegen x86asmparser x86disassembler)
+          message(STATUS "mapped: ${libs}")
+
+          add_executable(repro-archives repro.cpp)
+          target_link_libraries(repro-archives PRIVATE ${libs})
+
+          add_executable(repro-dylib repro.cpp)
+          target_link_libraries(repro-dylib PRIVATE "${LLVM_LIBRARY_DIR}/libLLVM.so")
+          EOF
+
+          cmake -S /tmp/repro -B /tmp/repro/build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_FLAGS_RELEASE="-O2 -g -DNDEBUG" \
+            -DCMAKE_PREFIX_PATH="$(brew --prefix llvm)" 2>&1 \
+            | grep -E "LLVM_|TARGET|mapped" | head -20
+          echo "!! configure exit: $?"
+
+          cmake --build /tmp/repro/build -j4 > /tmp/repro-build.log 2>&1
+          echo "!! build exit: $?"
+          tail -5 /tmp/repro-build.log
+
+          for v in archives dylib; do
+            echo "=== repro-${v} ==="
+            if [[ ! -x /tmp/repro/build/repro-${v} ]]; then echo "not built"; continue; fi
+            ldd /tmp/repro/build/repro-${v} | grep -i llvm || echo "  no libLLVM.so -> static"
+            /tmp/repro/build/repro-${v}
+            echo "!! repro-${v} exit: $?"
+          done
+
+          if [[ -x /tmp/repro/build/repro-archives ]]; then
+            echo "=== backtrace of repro-archives ==="
+            gdb -batch -nx \
+              -ex "set pagination off" \
+              -ex "run" \
+              -ex "p/x \$pc" -ex "info symbol \$pc" \
+              -ex "p \$_siginfo._sifields._sigfault.si_addr" \
+              -ex "bt" \
+              /tmp/repro/build/repro-archives 2>&1 | tail -30
+          fi
