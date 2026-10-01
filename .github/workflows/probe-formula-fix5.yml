@@ -1,0 +1,93 @@
+name: formula end to end (v5)
+
+on:
+  push:
+    branches: [probe/formula-fix5]
+  workflow_dispatch:
+
+jobs:
+  arm:
+    name: ${{ matrix.arm }}
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/homebrew/brew:main
+      options: --privileged
+    env:
+      HOMEBREW_NO_INSTALL_FROM_API: "1"
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+      HOMEBREW_NO_ENV_HINTS: "1"
+      HOME: /tmp/home
+    strategy:
+      fail-fast: false
+      matrix:
+        arm: [unpatched, lld, omit]
+    defaults:
+      run:
+        shell: bash -e -l {0}
+    steps:
+      - name: A writable HOME
+        run: |
+          mkdir -p /tmp/home
+          echo "HOME=$HOME writable=$([[ -w $HOME ]] && echo yes || echo no)"
+
+      - name: Install build deps
+        run: |
+          brew install cmake ninja llvm z3 zlib lld
+          echo "ld.lld: $(command -v ld.lld || echo MISSING)"
+
+      - name: Tap and patch the formula
+        run: |
+          set +e
+          brew tap fortran-lang/fortran
+          echo "!! tap exit: $?"
+          F="$(brew --repository fortran-lang/fortran)/Formula/lfortran.rb"
+          [[ -f $F ]] || { echo "no formula file"; exit 0; }
+
+          case "${{ matrix.arm }}" in
+            lld)
+              sed -i 's|^\( *\)cmake_args << "-DWITH_LSP=yes"$|\1cmake_args << "-DWITH_LSP=yes"\n\1cmake_args << "-DCMAKE_C_FLAGS=-fuse-ld=lld"\n\1cmake_args << "-DCMAKE_CXX_FLAGS=-fuse-ld=lld"|' "$F"
+              ;;
+            omit)
+              sed -i 's|^\( *\)cmake_args << "-DWITH_LSP=yes"$|\1cmake_args << "-DWITH_LSP=yes"\n\1cmake_args << "-DLLVM_OMIT_EXPORTS_FROM_CONFIG=ON"|' "$F"
+              ;;
+            *) echo "unpatched" ;;
+          esac
+          echo "--- install method after patching ---"
+          sed -n '/def install/,/^  end/p' "$F"
+          echo "--- does the patch change anything? ---"
+          grep -c 'fuse-ld\|OMIT_EXPORTS' "$F"
+
+      - name: brew install --build-from-source
+        run: |
+          set +e
+          brew install --build-from-source fortran-lang/fortran/lfortran > /tmp/install.log 2>&1
+          echo "!! brew install exit: $?"
+          grep -n -iE 'error|FAILED|Segmentation|cannot open shared' /tmp/install.log | head -20
+          echo "--- tail ---"
+          tail -15 /tmp/install.log
+
+      - name: brew test
+        run: |
+          set +e
+          brew test fortran-lang/fortran/lfortran > /tmp/test.log 2>&1
+          echo "!! brew test exit: $?"
+          echo "--- full test output ---"
+          cat /tmp/test.log
+
+      - name: Run hello world by hand
+        run: |
+          set +e
+          B="/home/linuxbrew/.linuxbrew/opt/lfortran/bin/lfortran"
+          [[ -x $B ]] || B="$(command -v lfortran)"
+          [[ -n $B && -x $B ]] || { echo "lfortran not found"; exit 0; }
+          echo "binary: $B"
+          printf 'program hello\n  print *, "Hello, World!"\nend program hello\n' > /tmp/hello.f90
+          echo "--- linkage ---"
+          ldd "$B" | grep -iE 'libLLVM|libunwind' || echo "  (neither)"
+          echo "--- --version ---"
+          "$B" --version > /tmp/v.txt 2>&1; echo "!! --version exit: $?"; head -3 /tmp/v.txt
+          echo "--- -c ---"
+          "$B" -c /tmp/hello.f90 -o /tmp/hello.o; echo "!! -c exit: $?"
+          echo "--- full compile ---"
+          "$B" /tmp/hello.f90 -o /tmp/hello; echo "!! full exit: $?"
+          if [[ -x /tmp/hello ]]; then /tmp/hello; echo "!! run exit: $?"; else echo "  no executable"; fi
