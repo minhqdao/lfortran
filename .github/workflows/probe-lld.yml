@@ -1,0 +1,86 @@
+name: archives linked with lld (v2)
+
+on:
+  push:
+    branches: [probe/lld2]
+  workflow_dispatch:
+
+jobs:
+  arm:
+    name: ${{ matrix.arm }}
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/homebrew/brew:main
+      options: --privileged
+    strategy:
+      fail-fast: false
+      matrix:
+        arm: [bfd, lld, lld-no-icf]
+    defaults:
+      run:
+        shell: bash -e -l {0}
+    steps:
+      - name: Install Homebrew LLVM, cmake, ninja, gdb
+        run: brew install llvm z3 zlib cmake ninja gdb lld
+
+      - name: Fetch source
+        run: |
+          curl -sSL -o /tmp/lfortran.tar.gz \
+            https://github.com/lfortran/lfortran/releases/download/v0.66.0/lfortran-0.66.0.tar.gz
+          echo "961d84f49d07951a279b7835e0f9864489a167a80a8c3c502a797fb6c61669c7  /tmp/lfortran.tar.gz" \
+            | sha256sum -c -
+          mkdir -p /tmp/src
+          tar xzf /tmp/lfortran.tar.gz -C /tmp/src --strip-components=1
+
+      - name: Configure and build
+        run: |
+          set +e
+          PREFIX="$(brew --prefix llvm)"
+          LDFLAGS=""
+          case "${{ matrix.arm }}" in
+            bfd)        LDFLAGS="" ;;
+            lld)        LDFLAGS="-fuse-ld=lld" ;;
+            lld-no-icf) LDFLAGS="-fuse-ld=lld -Wl,--icf=none" ;;
+          esac
+          cd /tmp/src
+          cmake . -GNinja -B build \
+            -DCMAKE_INSTALL_PREFIX=/tmp/inst \
+            -DCMAKE_INSTALL_LIBDIR=lib \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_FLAGS_RELEASE="-O3 -funroll-loops -DNDEBUG -g" \
+            -DWITH_LLVM=ON \
+            -DWITH_LSP=yes \
+            -DCMAKE_EXE_LINKER_FLAGS="${LDFLAGS} -L${PREFIX}/lib" \
+            -DCMAKE_PREFIX_PATH="${PREFIX};$(brew --prefix z3);$(brew --prefix zlib)" \
+            > /tmp/configure.log 2>&1
+          echo "!! configure exit: $?"
+          [[ -f build/build.ninja ]] || { tail -25 /tmp/configure.log; exit 0; }
+          echo "  archives: $(grep -oE 'libLLVM[A-Za-z0-9_.-]*\.a' build/build.ninja | sort -u | wc -l)"
+          command -v ld.lld && ld.lld --version || echo "  ld.lld not on PATH"
+          cmake --build build --target lfortran -j"$(nproc)" > /tmp/build.log 2>&1
+          echo "!! build exit: $?"
+          tail -2 /tmp/build.log
+          cmake --install build > /tmp/install.log 2>&1
+          echo "!! install exit: $?"
+
+      - name: Which linker, and does it crash
+        run: |
+          set +e
+          export LD_LIBRARY_PATH="/home/linuxbrew/.linuxbrew/lib:$(brew --prefix llvm)/lib"
+          printf 'program hello\n  print *, "Hello, World!"\nend program hello\n' > /tmp/hello.f90
+          B=/tmp/inst/bin/lfortran
+          [[ -x $B ]] || { echo "no lfortran binary"; exit 0; }
+          echo "--- linkage ---"
+          ldd "$B" | grep -iE 'libLLVM|libunwind' || echo "  (none of libLLVM/libunwind)"
+          echo "--- --version ---"
+          "$B" --version; echo "!! --version exit: $?"
+          echo "--- -c ---"
+          "$B" -c /tmp/hello.f90 -o /tmp/hello.o; echo "!! -c exit: $?"
+          if [[ ! -s /tmp/hello.o ]]; then
+            echo "--- backtrace ---"
+            gdb -batch -nx -ex "set pagination off" \
+              -ex "set environment LD_LIBRARY_PATH ${LD_LIBRARY_PATH}" \
+              -ex "run -c /tmp/hello.f90 -o /tmp/hello.o" \
+              -ex "p/x \$pc" -ex "info symbol \$pc" -ex "bt" \
+              --args "$B" 2>&1 | grep -E '^#|in section|^\$' | head -12
+          fi
