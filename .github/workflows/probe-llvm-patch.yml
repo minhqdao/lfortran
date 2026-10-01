@@ -7,6 +7,11 @@ name: probe llvm patch
 # LLVM 23.1.2, while the tag's own CI was green with conda-forge 23.1.1.
 
 on:
+  # A push trigger, not workflow_dispatch: GitHub only dispatches a workflow that
+  # exists on the default branch, and this probe must not touch the fork's main.
+  push:
+    branches:
+      - probe/llvm-patch
   workflow_dispatch:
 
 jobs:
