@@ -16,13 +16,13 @@ name: probe homebrew llvm
 # cell would also tell us the crash is introduced by the bottle/install path
 # rather than by the build.
 #
-# No `uses:` steps anywhere, and nothing written under $GITHUB_WORKSPACE: the brew
-# container's default user (linuxbrew) can write neither the runner's file-command
-# directory (`/__w/_temp/_runner_file_commands/save_state_*`) nor the workspace
-# itself (`/__w/<repo>/<repo>`, root-owned). `actions/checkout` dies with EACCES on
-# the first, and `mkdir` on the second. So the source is curled into $HOME/probe.
-# The tap's own CI never checks out and never writes the workspace, which is why
-# neither trap is visible from reading `tests.yml`.
+# No `uses:` steps anywhere, and nothing written under $GITHUB_WORKSPACE or $HOME:
+# inside the brew image both are root-owned, while the job runs as `linuxbrew`.
+# `actions/checkout` dies with EACCES on `/__w/_temp/_runner_file_commands/save_state_*`
+# (the runner's file-command directory), and anything else dies at `mkdir`. $HOME is
+# `/github/home`, not `/home/linuxbrew`. So the source is curled into /tmp/probe.
+# The tap's own CI never checks out and never writes those directories, which is why
+# none of this is visible from reading `tests.yml`.
 
 on:
   # A push trigger, not workflow_dispatch: GitHub only dispatches a workflow
@@ -52,6 +52,22 @@ jobs:
             flags: upstream
 
     steps:
+      # Every path here has surprised me once: the workspace and $HOME are both
+      # root-owned inside this image, so print the facts before relying on any.
+      - name: Where can we write
+        shell: bash -e -l {0}
+        run: |
+          id
+          echo "HOME=${HOME}  PWD=$(pwd)  WORKSPACE=${GITHUB_WORKSPACE}"
+          for d in /tmp "${HOME}" "${GITHUB_WORKSPACE}" /github/home /home/linuxbrew; do
+            if touch "${d}/.wtest" 2>/dev/null; then
+              echo "writable:   ${d}"
+              rm -f "${d}/.wtest"
+            else
+              echo "READ-ONLY:  ${d}"
+            fi
+          done
+
       # The release asset, not a git tag: this is exactly what the formula
       # builds. Note it contains no build0.sh -- the generated sources are
       # pre-baked -- which is why -DLFORTRAN_BUILD_ALL is a no-op here.
@@ -62,8 +78,8 @@ jobs:
             https://github.com/lfortran/lfortran/releases/download/v0.66.0/lfortran-0.66.0.tar.gz
           echo "961d84f49d07951a279b7835e0f9864489a167a80a8c3c502a797fb6c61669c7  /tmp/lfortran.tar.gz" \
             | sha256sum -c -
-          mkdir -p "$HOME/probe/src"
-          tar xzf /tmp/lfortran.tar.gz -C "$HOME/probe/src" --strip-components=1
+          mkdir -p /tmp/probe/src
+          tar xzf /tmp/lfortran.tar.gz -C /tmp/probe/src --strip-components=1
 
       - name: Install Homebrew LLVM and gdb
         if: matrix.llvm == 'homebrew'
@@ -108,7 +124,7 @@ jobs:
       - name: Build
         shell: bash -e -l {0}
         run: |
-          cd "$HOME/probe/src"
+          cd /tmp/probe/src
           if [[ "${{ matrix.llvm }}" == homebrew ]]; then
             LLVM_PREFIX="$(brew --prefix llvm)"
             PREFIX_ARGS="-DCMAKE_PREFIX_PATH=${LLVM_PREFIX};$(brew --prefix z3);$(brew --prefix zlib)"
@@ -155,7 +171,7 @@ jobs:
         shell: bash -e -l {0}
         run: |
           set +e
-          cd "$HOME/probe/src"
+          cd /tmp/probe/src
           LF="$(pwd)/inst/bin/lfortran"
           echo "=== ${{ matrix.name }} ==="
           if [[ ! -x "${LF}" ]]; then
@@ -178,7 +194,7 @@ jobs:
         shell: bash -e -l {0}
         run: |
           set +e
-          cd "$HOME/probe/src"
+          cd /tmp/probe/src
           if ! command -v gdb >/dev/null; then
             echo "!! no gdb available, skipping backtrace"
             exit 0
