@@ -1,0 +1,189 @@
+name: probe llvm link
+
+# Follow-up to lfortran/lfortran#13888, and the cheapest run that can answer it.
+#
+# Established: lfortran built against Homebrew's LLVM 23.1.2 on x86_64 segfaults
+# by jumping into `.rodata` at `&llvm::X86ReadAdvanceTable` (a data symbol), while
+# Homebrew's own llc/clang — which link libLLVM.so — are fine on the same backend.
+# `ldd` on the lfortran binary shows no libLLVM.so, so it links the component
+# archives. What is missing is *why*, and whether the archives alone are enough to
+# reproduce it without any lfortran code in the picture.
+#
+# This run builds nothing large: it configures lfortran and reads the link command
+# out of build.ninja, asks CMake how Homebrew's LLVMConfig resolves, and links a
+# 25-line program twice — once against the archives, once against the dylib.
+#
+# Container gotchas (the job runs as uid=1000(linuxbrew); only /tmp and
+# /home/linuxbrew are writable, and $HOME is /github/home): no `uses:` steps, and
+# nothing written under $GITHUB_WORKSPACE.
+
+on:
+  push:
+    branches:
+      - probe/llvm-link
+  workflow_dispatch:
+
+jobs:
+  probe:
+    name: static archives vs dylib
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    container:
+      image: ghcr.io/homebrew/brew:main
+      options: --privileged
+    steps:
+      - name: Install Homebrew LLVM, cmake, ninja
+        shell: bash -e -l {0}
+        run: |
+          brew install llvm z3 zlib cmake ninja
+          brew --prefix llvm
+
+      - name: Which LLVM installs are on the box
+        shell: bash -e -l {0}
+        run: |
+          set +e
+          echo "--- libLLVM.so* ---"
+          find / -name 'libLLVM.so*' -not -path '/proc/*' 2>/dev/null | head
+          echo "--- libLLVMCore.a ---"
+          find / -name 'libLLVMCore.a' -not -path '/proc/*' 2>/dev/null | head
+          echo "--- system llvm dirs ---"
+          ls -d /usr/lib/llvm* /usr/include/llvm* /usr/lib/cmake/llvm* 2>/dev/null
+          echo "--- llvm-config on PATH ---"
+          command -v llvm-config || echo none
+          echo "--- does the archive define the symbol, and how? ---"
+          PREFIX="$(brew --prefix llvm)"
+          echo "dylib:"; nm -C --defined-only "${PREFIX}/lib/libLLVM.so.23.1" 2>/dev/null | grep -i X86ReadAdvanceTable
+          echo "archive:"; nm -C --defined-only "${PREFIX}/lib/libLLVMX86Desc.a" 2>/dev/null | grep -i X86ReadAdvanceTable
+
+      - name: Fetch source
+        shell: bash -e -l {0}
+        run: |
+          curl -sSL -o /tmp/lfortran.tar.gz \
+            https://github.com/lfortran/lfortran/releases/download/v0.66.0/lfortran-0.66.0.tar.gz
+          echo "961d84f49d07951a279b7835e0f9864489a167a80a8c3c502a797fb6c61669c7  /tmp/lfortran.tar.gz" \
+            | sha256sum -c -
+          mkdir -p /tmp/probe/src
+          tar xzf /tmp/lfortran.tar.gz -C /tmp/probe/src --strip-components=1
+
+      # Configure only -- no compile. The link command is decided at configure
+      # time, so build.ninja already contains the answer.
+      - name: Configure lfortran and read its link command
+        shell: bash -e -l {0}
+        run: |
+          set +e
+          cd /tmp/probe/src
+          cmake . -GNinja \
+            -DCMAKE_INSTALL_PREFIX="$(pwd)/inst" \
+            -DCMAKE_INSTALL_LIBDIR=lib \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_FLAGS_RELEASE="-O3 -funroll-loops -DNDEBUG -g" \
+            -DWITH_LLVM=ON \
+            -DWITH_LSP=yes \
+            -DCMAKE_PREFIX_PATH="$(brew --prefix llvm);$(brew --prefix z3);$(brew --prefix zlib)" \
+            > /tmp/configure.log 2>&1
+          echo "configure exit: $?"
+          grep -E "Found LLVM|LLVMConfig|LIBUNWIND|Could NOT" /tmp/configure.log | head
+          echo "--- libLLVM references in build.ninja ---"
+          grep -o 'libLLVM[A-Za-z0-9_.-]*' build.ninja | sort | uniq -c | sort -rn | head -40
+          echo "--- the link command for the lfortran binary ---"
+          ninja -t commands lfortran 2>/dev/null | tail -1 \
+            | tr ' ' '\n' | grep -iE 'llvm|^-o$' | sed 's#.*/##' | sort | uniq -c | sort -rn | head -30
+
+      - name: How Homebrew's LLVMConfig resolves
+        shell: bash -e -l {0}
+        run: |
+          set +e
+          mkdir -p /tmp/introspect
+          cat > /tmp/introspect/CMakeLists.txt <<'EOF'
+          cmake_minimum_required(VERSION 3.20)
+          project(introspect CXX)
+          find_package(LLVM REQUIRED CONFIG)
+          message(STATUS "LLVM_DIR=${LLVM_DIR}")
+          message(STATUS "LLVM_PACKAGE_VERSION=${LLVM_PACKAGE_VERSION}")
+          message(STATUS "LLVM_LINK_LLVM_DYLIB=${LLVM_LINK_LLVM_DYLIB}")
+          if (TARGET LLVMCore)
+            get_target_property(t LLVMCore TYPE)
+            get_target_property(l LLVMCore IMPORTED_LOCATION)
+            get_target_property(il LLVMCore INTERFACE_LINK_LIBRARIES)
+            message(STATUS "TARGET LLVMCore = TRUE  TYPE=${t} LOCATION=${l} INTERFACE=${il}")
+          else()
+            message(STATUS "TARGET LLVMCore = FALSE")
+          endif()
+          llvm_map_components_to_libnames(libs core support mcjit orcjit native asmparser asmprinter targetparser x86info x86desc x86codegen x86asmparser x86disassembler)
+          message(STATUS "mapped: ${libs}")
+          find_library(LLVMCORE_LIB NAMES LLVMCore PATHS "${LLVM_LIBRARY_DIR}" NO_DEFAULT_PATH)
+          message(STATUS "find_library(LLVMCore) = ${LLVMCORE_LIB}")
+          EOF
+          cmake -S /tmp/introspect -B /tmp/introspect/build \
+            -DCMAKE_PREFIX_PATH="$(brew --prefix llvm)" 2>&1 | grep -E "LLVM|mapped|TARGET|find_library" | head -30
+
+      # The minimal reproducer: no lfortran code at all, just the same call path
+      # that BasicAA takes (getTargetIRAnalysis -> getSubtargetImpl).
+      - name: Minimal reproducer, archives vs dylib
+        shell: bash -e -l {0}
+        run: |
+          set +e
+          PREFIX="$(brew --prefix llvm)"
+          cat > /tmp/repro.cpp <<'EOF'
+          #include "llvm/IR/Function.h"
+          #include "llvm/IR/IRBuilder.h"
+          #include "llvm/IR/LLVMContext.h"
+          #include "llvm/IR/Module.h"
+          #include "llvm/MC/TargetRegistry.h"
+          #include "llvm/Support/TargetSelect.h"
+          #include "llvm/Target/TargetMachine.h"
+          #include "llvm/Target/TargetOptions.h"
+          #include "llvm/TargetParser/Host.h"
+          #include <cstdio>
+          #include <memory>
+
+          int main() {
+            llvm::InitializeNativeTarget();
+            llvm::InitializeNativeTargetAsmPrinter();
+            llvm::Triple TT(llvm::sys::getDefaultTargetTriple());
+            std::string Err;
+            const llvm::Target *T = llvm::TargetRegistry::lookupTarget(TT, Err);
+            if (!T) { std::fprintf(stderr, "no target: %s\n", Err.c_str()); return 2; }
+            std::unique_ptr<llvm::TargetMachine> TM(
+                T->createTargetMachine(TT, "generic", "", llvm::TargetOptions()));
+            if (!TM) { std::fprintf(stderr, "no target machine\n"); return 2; }
+
+            llvm::LLVMContext Ctx;
+            auto M = std::make_unique<llvm::Module>("m", Ctx);
+            llvm::IRBuilder<> B(Ctx);
+            auto *FT = llvm::FunctionType::get(B.getInt32Ty(), false);
+            auto *F = llvm::Function::Create(FT, llvm::GlobalValue::ExternalLinkage, "f", M.get());
+
+            std::printf("calling getTargetIRAnalysis...\n");
+            std::fflush(stdout);
+            auto TIRA = TM->getTargetIRAnalysis();
+            TIRA(*F);
+            std::printf("ok\n");
+            return 0;
+          }
+          EOF
+
+          COMPONENTS="x86codegen x86desc x86info x86asmparser x86disassembler mc support targetparser"
+          echo "=== llvm-config --libs (static) ==="
+          "${PREFIX}/bin/llvm-config" --libs ${COMPONENTS}
+          echo "=== llvm-config --link-shared --libs ==="
+          "${PREFIX}/bin/llvm-config" --link-shared --libs ${COMPONENTS}
+
+          "${PREFIX}/bin/clang++" -O2 -g $( "${PREFIX}/bin/llvm-config" --cxxflags ) /tmp/repro.cpp \
+            $( "${PREFIX}/bin/llvm-config" --ldflags --libs ${COMPONENTS} ) \
+            $( "${PREFIX}/bin/llvm-config" --system-libs ) -o /tmp/repro-static 2> /tmp/static-build.log
+          echo "!! static link exit: $?"; tail -5 /tmp/static-build.log
+
+          "${PREFIX}/bin/clang++" -O2 -g $( "${PREFIX}/bin/llvm-config" --cxxflags ) /tmp/repro.cpp \
+            $( "${PREFIX}/bin/llvm-config" --ldflags --link-shared --libs ${COMPONENTS} ) \
+            $( "${PREFIX}/bin/llvm-config" --system-libs ) -o /tmp/repro-shared 2> /tmp/shared-build.log
+          echo "!! shared link exit: $?"; tail -5 /tmp/shared-build.log
+
+          for v in static shared; do
+            echo "=== repro-${v} ==="
+            if [[ ! -x /tmp/repro-${v} ]]; then echo "not built"; continue; fi
+            echo "--- does it load libLLVM.so? ---"
+            ldd /tmp/repro-${v} | grep -i llvm || echo "no libLLVM.so (static)"
+            /tmp/repro-${v}
+            echo "!! repro-${v} exit: $?"
+          done
