@@ -56,6 +56,12 @@ jobs:
             binutils=2.45.1
             zstd-static=1.5.7
 
+      # Upstream installs this separately for llvm-version > 11; without it cmake
+      # dies at "Could NOT find LIBUNWIND (missing: LIBUNWIND_INCLUDE_DIR ...)".
+      - name: Install libunwind
+        shell: bash -e -l {0}
+        run: micromamba install -y -n lf libunwind=1.7.2
+
       - name: Which LLVM conda actually gave us
         shell: bash -e -l {0}
         run: |
