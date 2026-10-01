@@ -1,0 +1,89 @@
+name: real formula with the fix
+
+on:
+  push:
+    branches: [probe/formula-fix]
+  workflow_dispatch:
+
+jobs:
+  arm:
+    name: ${{ matrix.arm }}
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/homebrew/brew:main
+      options: --privileged
+    env:
+      HOMEBREW_NO_INSTALL_FROM_API: "1"
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+    strategy:
+      fail-fast: false
+      matrix:
+        arm: [minimal, rpath]
+    defaults:
+      run:
+        shell: bash -e -l {0}
+    steps:
+      - name: Install build deps
+        run: brew install cmake ninja llvm z3 zlib
+
+      - name: Fetch the tap formula and patch it
+        run: |
+          set +e
+          mkdir -p /tmp/tap/Formula
+          curl -sSL -o /tmp/tap/Formula/lfortran.rb \
+            https://raw.githubusercontent.com/fortran-lang/homebrew-fortran/main/Formula/lfortran.rb
+          echo "--- the install method before patching ---"
+          sed -n '/def install/,/^  end/p' /tmp/tap/Formula/lfortran.rb
+
+          cat > /tmp/patch.rb <<'RBEOF'
+          p = "/tmp/tap/Formula/lfortran.rb"
+          s = File.read(p)
+          anchor = %q{cmake_args << "-DWITH_LSP=yes"}
+          abort("anchor not found") unless s.include?(anchor)
+          extra = [%q{cmake_args << "-DLLVM_OMIT_EXPORTS_FROM_CONFIG=ON"}]
+          if ENV["ARM"] == "rpath"
+            extra << %q{cmake_args << "-DCMAKE_EXE_LINKER_FLAGS=-Wl,-rpath,#{Formula["llvm"].opt_lib}"}
+          end
+          s = s.sub(anchor, ([anchor] + extra).join("\n    "))
+          File.write(p, s)
+          puts "patched"
+          RBEOF
+          ARM="${{ matrix.arm }}" ruby /tmp/patch.rb
+          echo "--- after patching ---"
+          sed -n '/def install/,/^  end/p' /tmp/tap/Formula/lfortran.rb
+
+      - name: brew install --build-from-source
+        run: |
+          set +e
+          brew install --build-from-source --verbose /tmp/tap/Formula/lfortran.rb \
+            > /tmp/install.log 2>&1
+          echo "!! brew install exit: $?"
+          echo "--- errors ---"
+          grep -n -iE 'error|FAILED|Segmentation|Error:' /tmp/install.log | head -30
+          echo "--- tail ---"
+          tail -30 /tmp/install.log
+
+      - name: brew test
+        run: |
+          set +e
+          brew test lfortran > /tmp/test.log 2>&1
+          echo "!! brew test exit: $?"
+          tail -30 /tmp/test.log
+
+      - name: Run hello world by hand
+        run: |
+          set +e
+          B="$(brew --prefix lfortran)/bin/lfortran"
+          [[ -x $B ]] || B="$(command -v lfortran)"
+          [[ -n $B && -x $B ]] || { echo "lfortran not found"; exit 0; }
+          echo "binary: $B"
+          printf 'program hello\n  print *, "Hello, World!"\nend program hello\n' > /tmp/hello.f90
+          echo "--- linkage ---"
+          ldd "$B" | grep -iE 'libLLVM|libunwind'
+          echo "--- --version ---"
+          "$B" --version; echo "!! --version exit: $?"
+          echo "--- -c ---"
+          "$B" -c /tmp/hello.f90 -o /tmp/hello.o; echo "!! -c exit: $?"
+          echo "--- full compile ---"
+          "$B" /tmp/hello.f90 -o /tmp/hello; echo "!! full exit: $?"
+          if [[ -x /tmp/hello ]]; then /tmp/hello; echo "!! run exit: $?"; else echo "  no executable"; fi
