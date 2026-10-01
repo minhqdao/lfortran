@@ -16,12 +16,16 @@ name: probe homebrew llvm
 # cell would also tell us the crash is introduced by the bottle/install path
 # rather than by the build.
 #
-# No `uses:` steps anywhere, and nothing written under $GITHUB_WORKSPACE or $HOME:
-# inside the brew image both are root-owned, while the job runs as `linuxbrew`.
-# `actions/checkout` dies with EACCES on `/__w/_temp/_runner_file_commands/save_state_*`
-# (the runner's file-command directory), and anything else dies at `mkdir`. $HOME is
-# `/github/home`, not `/home/linuxbrew`. So the source is curled into /tmp/probe.
-# The tap's own CI never checks out and never writes those directories, which is why
+# Container gotchas, all of which cost a run to find. The job runs as
+# uid=1000(linuxbrew) and:
+#   - `/__w/_temp/_runner_file_commands/` is root-owned, so any JS action
+#     (`actions/checkout`, `setup-micromamba`) dies with EACCES on
+#     `save_state_*` in its main *and* post step. Hence no `uses:` at all.
+#   - `$GITHUB_WORKSPACE` (`/__w/<repo>/<repo>`) is root-owned: `mkdir` fails.
+#   - `$HOME` is `/github/home`, not `/home/linuxbrew`, and is root-owned too:
+#     micromamba dies on `/github/home/.mamba/pkgs` and `.conda/environments.txt`.
+#   - writable: `/tmp` and `/home/linuxbrew`.
+# The tap's own CI never checks out and never writes those paths, which is why
 # none of this is visible from reading `tests.yml`.
 
 on:
@@ -52,17 +56,14 @@ jobs:
             flags: upstream
 
     steps:
-      # Every path here has surprised me once: the workspace and $HOME are both
-      # root-owned inside this image, so print the facts before relying on any.
       - name: Where can we write
         shell: bash -e -l {0}
         run: |
           id
           echo "HOME=${HOME}  PWD=$(pwd)  WORKSPACE=${GITHUB_WORKSPACE}"
-          for d in /tmp "${HOME}" "${GITHUB_WORKSPACE}" /github/home /home/linuxbrew; do
+          for d in /tmp "${HOME}" "${GITHUB_WORKSPACE}" /home/linuxbrew; do
             if touch "${d}/.wtest" 2>/dev/null; then
-              echo "writable:   ${d}"
-              rm -f "${d}/.wtest"
+              echo "writable:   ${d}"; rm -f "${d}/.wtest"
             else
               echo "READ-ONLY:  ${d}"
             fi
@@ -81,23 +82,27 @@ jobs:
           mkdir -p /tmp/probe/src
           tar xzf /tmp/lfortran.tar.gz -C /tmp/probe/src --strip-components=1
 
-      - name: Install Homebrew LLVM and gdb
+      # cmake and ninja are build deps of the formula; without them the build
+      # step dies with `cmake: command not found` (exit 127).
+      - name: Install Homebrew LLVM, cmake, ninja, gdb
         if: matrix.llvm == 'homebrew'
         shell: bash -e -l {0}
         run: |
-          brew install llvm z3 zlib gdb
+          brew install llvm z3 zlib cmake ninja gdb
           brew --prefix llvm
 
       # Installed by hand rather than with setup-micromamba, for the same reason
-      # there is no checkout: it is a JS action.
+      # there is no checkout: it is a JS action. HOME is repointed at /tmp
+      # because /github/home is read-only and micromamba writes $HOME/.mamba.
       - name: Install conda LLVM
         if: matrix.llvm == 'conda'
         shell: bash -e -l {0}
         run: |
+          export HOME=/tmp
+          export MAMBA_ROOT_PREFIX=/tmp/mmroot
           curl -sSL -o /tmp/micromamba \
             https://github.com/mamba-org/micromamba-releases/releases/latest/download/micromamba-linux-64
           chmod +x /tmp/micromamba
-          export MAMBA_ROOT_PREFIX=/tmp/mmroot
           /tmp/micromamba create -y -p /tmp/lf -c conda-forge \
             llvmdev=23.1.2 libunwind=1.7.2 bison=3.4 re2c=3.1 \
             cmake=3.29.1 ninja=1.11.1 make=4.3 binutils=2.45.1 zstd-static=1.5.7
@@ -119,17 +124,26 @@ jobs:
           echo "--- abi-breaking.h ---"
           grep -E "^#define LLVM_ENABLE" "${PREFIX}"/include/llvm/Config/abi-breaking.h
           echo "--- libLLVM ---"
-          ls -l "${PREFIX}"/lib/libLLVM* 2>/dev/null | head
+          ls -l "${PREFIX}"/lib/libLLVM.so* 2>/dev/null | head
 
       - name: Build
         shell: bash -e -l {0}
         run: |
           cd /tmp/probe/src
           if [[ "${{ matrix.llvm }}" == homebrew ]]; then
-            LLVM_PREFIX="$(brew --prefix llvm)"
-            PREFIX_ARGS="-DCMAKE_PREFIX_PATH=${LLVM_PREFIX};$(brew --prefix z3);$(brew --prefix zlib)"
+            PREFIX_ARGS="-DCMAKE_PREFIX_PATH=$(brew --prefix llvm);$(brew --prefix z3);$(brew --prefix zlib)"
+            TRAP="$(brew --repo)/Library/Homebrew/cmake/trap_fetchcontent_provider.cmake"
+            if [[ -f "${TRAP}" ]]; then
+              TRAP_ARG="-DCMAKE_PROJECT_TOP_LEVEL_INCLUDES=${TRAP}"
+              echo "using Homebrew's FetchContent trap: ${TRAP}"
+            else
+              TRAP_ARG=""
+              echo "no FetchContent trap at ${TRAP}"
+            fi
           else
+            export PATH="/tmp/lf/bin:${PATH}"
             PREFIX_ARGS="-DCMAKE_PREFIX_PATH=/tmp/lf"
+            TRAP_ARG=""
           fi
 
           if [[ "${{ matrix.flags }}" == formula ]]; then
@@ -141,13 +155,13 @@ jobs:
               -DCMAKE_BUILD_TYPE=Release \
               -DCMAKE_FIND_FRAMEWORK=LAST \
               -DCMAKE_VERBOSE_MAKEFILE=ON \
-              -DCMAKE_PROJECT_TOP_LEVEL_INCLUDES="$(brew --repo)/Library/Homebrew/cmake/trap_fetchcontent_provider.cmake" \
               -Wno-author \
               -DBUILD_TESTING=OFF \
               -DCCACHE_FOUND=OFF \
               -DCMAKE_CXX_FLAGS_RELEASE="-O3 -funroll-loops -DNDEBUG -g" \
               -DWITH_LLVM=ON \
               -DWITH_LSP=yes \
+              ${TRAP_ARG} \
               "${PREFIX_ARGS}"
           else
             # Upstream's own recipe (Exhaustive-Checks-CI.yml at v0.66.0), minus
