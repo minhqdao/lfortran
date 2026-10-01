@@ -1,0 +1,97 @@
+name: probe llvm patch
+
+# Temporary probe for lfortran/lfortran#13888.
+# Builds the v0.66.0 tag and main with conda-forge LLVM 23.1.1 / 23.1.2 on x86_64,
+# outside Homebrew, holding everything else at upstream's own CI configuration.
+# `brew install lfortran` on x86_64 Linux segfaults on hello world with Homebrew's
+# LLVM 23.1.2, while the tag's own CI was green with conda-forge 23.1.1.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    name: ${{ matrix.ref }} + llvmdev ${{ matrix.llvmdev }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Control: reproduces the tag's own green job.
+          - ref: v0.66.0
+            llvmdev: "23.1.1"
+          # Decisive cell: same source, same everything, only the LLVM patch moves.
+          - ref: v0.66.0
+            llvmdev: "23.1.2"
+          # Control: reproduces today's green main job.
+          - ref: main
+            llvmdev: "23.1.2"
+
+    steps:
+      # Always upstream's source, never the fork's, so provenance is unambiguous.
+      - uses: actions/checkout@v7
+        with:
+          repository: lfortran/lfortran
+          ref: ${{ matrix.ref }}
+          fetch-depth: 0
+
+      - uses: mamba-org/setup-micromamba@v2.0.2
+        with:
+          micromamba-version: "2.0.4-0"
+          environment-file: ci/environment_linux_llvm.yml
+          create-args: >-
+            python=3.10
+            llvmdev=${{ matrix.llvmdev }}
+            bison=3.4
+            openblas=0.3.21
+            llvm-openmp=14.0.4
+            make=4.3
+            openmpi=5.0.10
+            binutils=2.45.1
+            zstd-static=1.5.7
+
+      - name: Which LLVM conda actually gave us
+        shell: bash -e -l {0}
+        run: |
+          micromamba list -n lf 2>/dev/null | grep -iE "^ *(llvm|llvmdev|cmake|ninja) " || true
+          echo "llvm-config: $(command -v llvm-config || echo MISSING)"
+          llvm-config --version || true
+
+      # Upstream's own build recipe (Exhaustive-Checks-CI.yml at v0.66.0), minus the
+      # sccache launchers, which are not in the conda environment.
+      - name: Build
+        shell: bash -e -l {0}
+        run: |
+          ./build0.sh
+          cmake . -GNinja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_FLAGS_RELEASE="-O3 -funroll-loops -DNDEBUG" \
+            -DWITH_LLVM=yes \
+            -DWITH_LSP=yes \
+            -DLFORTRAN_BUILD_ALL=yes \
+            -DWITH_STACKTRACE=no \
+            -DCMAKE_PREFIX_PATH="$CONDA_PREFIX" \
+            -DCMAKE_INSTALL_PREFIX="$(pwd)/inst"
+          cmake --build . -j"$(nproc)" --target install
+
+      - name: Probe hello world
+        if: always()
+        shell: bash -e -l {0}
+        run: |
+          set +e
+          LF="$(pwd)/inst/bin/lfortran"
+          echo "=== ${{ matrix.ref }} + llvmdev ${{ matrix.llvmdev }} ==="
+          if [[ ! -x "${LF}" ]]; then
+            echo "!! build produced no lfortran binary"
+            exit 0
+          fi
+          "${LF}" --version
+          echo "!! --version exit: $?"
+          printf 'program hello\n  print *, "Hello, World!"\nend program hello\n' > /tmp/hello.f90
+          "${LF}" -c /tmp/hello.f90 -o /tmp/hello.o
+          echo "!! -c exit: $?"
+          "${LF}" /tmp/hello.f90 -o /tmp/hello
+          echo "!! full exit: $?"
+          /tmp/hello
+          echo "!! run exit: $?"
